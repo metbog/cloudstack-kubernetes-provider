@@ -25,10 +25,16 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/apache/cloudstack-go/v2/cloudstack"
 	"gopkg.in/gcfg.v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes"
 	cloudprovider "k8s.io/cloud-provider"
 	"k8s.io/klog/v2"
 )
@@ -50,9 +56,10 @@ type CSConfig struct {
 
 // CSCloud is an implementation of Interface for CloudStack.
 type CSCloud struct {
-	client    *cloudstack.CloudStackClient
-	projectID string // If non-"", all resources will be created within this project
-	zone      string
+	client     *cloudstack.CloudStackClient
+	kubeClient kubernetes.Interface
+	projectID  string // If non-"", all resources will be created within this project
+	zone       string
 }
 
 func init() {
@@ -100,6 +107,21 @@ func newCSCloud(cfg *CSConfig) (*CSCloud, error) {
 
 // Initialize passes a Kubernetes clientBuilder interface to the cloud provider
 func (cs *CSCloud) Initialize(clientBuilder cloudprovider.ControllerClientBuilder, stop <-chan struct{}) {
+	if clientBuilder != nil {
+		kubeClient, err := clientBuilder.Client("")
+		if err != nil {
+			klog.Warningf("Failed to create Kubernetes client: %v", err)
+		} else {
+			cs.kubeClient = kubeClient
+			klog.V(2).Infof("Successfully initialized Kubernetes client for endpoint-aware load balancing")
+
+			// Start endpoint watcher for automatic load balancer updates
+			klog.V(2).Infof("Starting endpoint watcher goroutine")
+			go cs.startEndpointWatcher(stop)
+		}
+	} else {
+		klog.Warningf("No clientBuilder provided - endpoint watcher will not start")
+	}
 }
 
 // LoadBalancer returns an implementation of LoadBalancer for CloudStack.
@@ -237,4 +259,136 @@ func (cs *CSCloud) GetZoneByNodeName(ctx context.Context, nodeName types.NodeNam
 	zone.Region = instance.Zonename
 
 	return zone, nil
+}
+
+// startEndpointWatcher watches for endpoint changes and automatically updates load balancers
+// for services with externalTrafficPolicy: Local
+func (cs *CSCloud) startEndpointWatcher(stop <-chan struct{}) {
+	klog.V(2).Infof("Starting endpoint watcher for automatic load balancer updates")
+
+	// Create a map to debounce updates (avoid too frequent updates for the same service)
+	pendingUpdates := make(map[string]*time.Timer)
+
+	// Watch all endpoints
+	watchlist := &metav1.ListOptions{
+		FieldSelector: fields.Everything().String(),
+	}
+
+	for {
+		select {
+		case <-stop:
+			klog.V(2).Infof("Stopping endpoint watcher")
+			return
+		default:
+		}
+
+		watcher, err := cs.kubeClient.CoreV1().Endpoints("").Watch(context.TODO(), *watchlist)
+		if err != nil {
+			klog.Errorf("Failed to watch endpoints: %v", err)
+			time.Sleep(30 * time.Second)
+			continue
+		}
+
+		klog.V(2).Infof("Endpoint watcher connected successfully, watching for changes")
+
+	watchLoop:
+		for {
+			select {
+			case <-stop:
+				watcher.Stop()
+				klog.V(2).Infof("Stopping endpoint watcher")
+				return
+			case event, ok := <-watcher.ResultChan():
+				if !ok {
+					klog.V(4).Infof("Endpoint watcher disconnected, reconnecting")
+					break watchLoop
+				}
+
+				if event.Type == watch.Modified || event.Type == watch.Added {
+					if endpoints, ok := event.Object.(*corev1.Endpoints); ok {
+						klog.V(4).Infof("Received endpoint event: %s for %s/%s", event.Type, endpoints.Namespace, endpoints.Name)
+						cs.handleEndpointUpdate(endpoints, pendingUpdates)
+					}
+				}
+			}
+		}
+
+		watcher.Stop()
+		time.Sleep(5 * time.Second) // Wait before reconnecting
+	}
+}
+
+// handleEndpointUpdate processes endpoint changes and triggers load balancer updates if needed
+func (cs *CSCloud) handleEndpointUpdate(endpoints *corev1.Endpoints, pendingUpdates map[string]*time.Timer) {
+	serviceKey := endpoints.Namespace + "/" + endpoints.Name
+
+	klog.V(4).Infof("Processing endpoint update for service %s", serviceKey)
+
+	// Get the corresponding service
+	service, err := cs.kubeClient.CoreV1().Services(endpoints.Namespace).Get(context.TODO(), endpoints.Name, metav1.GetOptions{})
+	if err != nil {
+		klog.Errorf("Could not find service %s: %v", serviceKey, err)
+		return
+	}
+
+	klog.V(4).Infof("Found service %s: Type=%s, ExternalTrafficPolicy=%s", serviceKey, service.Spec.Type, service.Spec.ExternalTrafficPolicy)
+
+	// Only process LoadBalancer services with Local external traffic policy
+	if service.Spec.Type != corev1.ServiceTypeLoadBalancer {
+		klog.V(4).Infof("Ignoring service %s: not a LoadBalancer (Type=%s)", serviceKey, service.Spec.Type)
+		return
+	}
+
+	if service.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyTypeLocal {
+		klog.V(4).Infof("Ignoring service %s: not Local traffic policy (ExternalTrafficPolicy=%s)",
+			serviceKey, service.Spec.ExternalTrafficPolicy)
+		return
+	}
+
+	klog.V(2).Infof("Endpoint change detected for LoadBalancer service %s with Local traffic policy - scheduling update", serviceKey)
+
+	// Cancel any existing pending update for this service
+	if timer, exists := pendingUpdates[serviceKey]; exists {
+		klog.V(4).Infof("Cancelling previous pending update for service %s", serviceKey)
+		timer.Stop()
+		delete(pendingUpdates, serviceKey)
+	}
+
+	// Schedule a debounced update (wait 10 seconds for more changes)
+	klog.V(4).Infof("Scheduling debounced update for service %s (10s delay)", serviceKey)
+	pendingUpdates[serviceKey] = time.AfterFunc(10*time.Second, func() {
+		delete(pendingUpdates, serviceKey)
+		cs.updateLoadBalancerForEndpointChange(service)
+	})
+}
+
+// updateLoadBalancerForEndpointChange triggers EnsureLoadBalancer for a service whose endpoints changed
+func (cs *CSCloud) updateLoadBalancerForEndpointChange(service *corev1.Service) {
+	klog.V(2).Infof("Triggering load balancer update for service %s/%s due to endpoint changes",
+		service.Namespace, service.Name)
+
+	// Get all cluster nodes
+	nodes, err := cs.kubeClient.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		klog.Errorf("Failed to list nodes for load balancer update: %v", err)
+		return
+	}
+
+	klog.V(4).Infof("Retrieved %d cluster nodes for load balancer update", len(nodes.Items))
+
+	// Convert to []*corev1.Node
+	nodePointers := make([]*corev1.Node, len(nodes.Items))
+	for i := range nodes.Items {
+		nodePointers[i] = &nodes.Items[i]
+	}
+
+	// Call EnsureLoadBalancer to update the load balancer
+	_, err = cs.EnsureLoadBalancer(context.TODO(), "", service, nodePointers)
+	if err != nil {
+		klog.Errorf("Failed to update load balancer for service %s/%s: %v",
+			service.Namespace, service.Name, err)
+	} else {
+		klog.V(2).Infof("Successfully updated load balancer for service %s/%s due to endpoint changes",
+			service.Namespace, service.Name)
+	}
 }
