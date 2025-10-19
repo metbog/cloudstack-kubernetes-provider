@@ -147,115 +147,21 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 	klog.V(4).Infof("Load balancer %v is associated with IP %v", lb.name, lb.ipAddr)
 
 	for _, port := range service.Spec.Ports {
-		// Construct the protocol name first, we need it a few times
 		protocol := ProtocolFromServicePort(port, service)
 		if protocol == LoadBalancerProtocolInvalid {
 			return nil, fmt.Errorf("unsupported load balancer protocol: %v", port.Protocol)
 		}
 
-		// All ports have their own load balancer rule, so add the port to lbName to keep the names unique.
-		lbRuleName := fmt.Sprintf("%s-%s-%d", lb.name, protocol, port.Port)
-
-		// If the load balancer rule exists and is up-to-date, we move on to the next rule.
-		lbRule, needsUpdate, err := lb.checkLoadBalancerRule(lbRuleName, port, protocol)
+		reconciledRule, skip, err := lb.reconcilePort(service, port, protocol)
 		if err != nil {
 			return nil, err
 		}
 
-		// Ensure the existing rule (if any) is on the expected network
-		if lbRule != nil {
-			if valid, validationErr := lb.validateLoadBalancerRuleNetwork(lbRule); !valid {
-				klog.Warningf("Load balancer rule %s has invalid network configuration: %v", lbRuleName, validationErr)
-				klog.Infof("Recreating load balancer rule %s due to network mismatch", lbRuleName)
+		lbRuleName := fmt.Sprintf("%s-%s-%d", lb.name, protocol, port.Port)
+		delete(lb.rules, lbRuleName)
 
-				if deleteErr := lb.deleteLoadBalancerRule(lbRule); deleteErr != nil {
-					return nil, fmt.Errorf("failed to delete load balancer rule %s during network validation: %v", lbRuleName, deleteErr)
-				}
-
-				lbRule = nil
-				needsUpdate = false
-			}
-		}
-
-		if lbRule != nil {
-			if len(lb.hostIDs) == 0 {
-				klog.V(2).Infof("Service %s/%s rule %s: desired host list empty, keeping current members to avoid churn", service.Namespace, service.Name, lbRuleName)
-				delete(lb.rules, lbRuleName)
-				continue
-			}
-
-			if needsUpdate {
-				klog.V(2).Infof("Updating load balancer rule: %v", lbRuleName)
-				if err := lb.updateLoadBalancerRule(lbRuleName, protocol); err != nil {
-					return nil, err
-				}
-			}
-
-			// CRITICAL FIX: Check and update existing rule members for endpoint changes
-			klog.V(2).Infof("Checking members for existing load balancer rule: %v", lbRuleName)
-
-			// Get current members of this rule
-			p := lb.LoadBalancer.NewListLoadBalancerRuleInstancesParams(lbRule.Id)
-			l, err := lb.LoadBalancer.ListLoadBalancerRuleInstances(p)
-			if err != nil {
-				return nil, fmt.Errorf("error retrieving associated instances for rule %s: %v", lbRuleName, err)
-			}
-
-			// Log current members
-			currentMembers := make([]string, len(l.LoadBalancerRuleInstances))
-			for i, instance := range l.LoadBalancerRuleInstances {
-				currentMembers[i] = instance.Id
-			}
-			klog.V(2).Infof("Service %s/%s rule %s: current members: %v, expected: %v",
-				service.Namespace, service.Name, lbRuleName, currentMembers, lb.hostIDs)
-
-			// Check if members need updating
-			assign, remove := symmetricDifference(lb.hostIDs, l.LoadBalancerRuleInstances)
-
-			if len(assign) > 0 {
-				klog.Infof("Updating members of load balancer rule %s: adding %d hosts %v", lbRuleName, len(assign), assign)
-				klog.V(2).Infof("Service %s/%s rule %s: assigning new hosts: %v",
-					service.Namespace, service.Name, lbRuleName, assign)
-				if err := lb.assignHostsToRule(lbRule, assign); err != nil {
-					return nil, err
-				}
-			}
-
-			if len(remove) > 0 {
-				klog.Infof("Updating members of load balancer rule %s: removing %d hosts %v", lbRuleName, len(remove), remove)
-				klog.V(2).Infof("Service %s/%s rule %s: removing old hosts: %v",
-					service.Namespace, service.Name, lbRuleName, remove)
-				if err := lb.removeHostsFromRule(lbRule, remove); err != nil {
-					return nil, err
-				}
-			}
-
-			if len(assign) == 0 && len(remove) == 0 {
-				klog.V(2).Infof("Service %s/%s rule %s: members are up-to-date",
-					service.Namespace, service.Name, lbRuleName)
-			}
-
-			// Delete the rule from the map, to prevent it being deleted.
-			delete(lb.rules, lbRuleName)
-		} else {
-			klog.V(2).Infof("Creating load balancer rule: %v", lbRuleName)
-			lbRule, err = lb.createLoadBalancerRule(lbRuleName, port, protocol)
-			if err != nil {
-				return nil, err
-			}
-
-			if len(lb.hostIDs) == 0 {
-				klog.V(2).Infof("Service %s/%s rule %s: created without members (no desired hosts)", service.Namespace, service.Name, lbRuleName)
-				delete(lb.rules, lbRuleName)
-				continue
-			}
-
-			// Only assign hosts if we have any
-			klog.Infof("Creating members for new load balancer rule %s: adding %d hosts %v", lbRuleName, len(lb.hostIDs), lb.hostIDs)
-			klog.V(2).Infof("Assigning hosts (%v) to load balancer rule: %v", lb.hostIDs, lbRuleName)
-			if err = lb.assignHostsToRule(lbRule, lb.hostIDs); err != nil {
-				return nil, err
-			}
+		if skip || reconciledRule == nil {
+			continue
 		}
 
 		network, count, err := lb.Network.GetNetworkByID(lb.networkID, cloudstack.WithProject(lb.projectID))
@@ -266,17 +172,15 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 			return nil, err
 		}
 
-		if lbRule != nil {
-			if isFirewallSupported(network.Service) {
-				klog.V(4).Infof("Creating firewall rules for load balancer rule: %v (%v:%v:%v)", lbRuleName, protocol, lbRule.Publicip, port.Port)
-				if _, err := lb.updateFirewallRule(lbRule.Publicipid, int(port.Port), protocol, service.Spec.LoadBalancerSourceRanges); err != nil {
-					return nil, err
-				}
-			} else if isNetworkACLSupported(network.Service) {
-				klog.V(4).Infof("Creating ACL rules for load balancer rule: %v (%v:%v:%v)", lbRuleName, protocol, lbRule.Publicip, port.Port)
-				if _, err := lb.updateNetworkACL(int(port.Port), protocol, network.Id); err != nil {
-					return nil, err
-				}
+		if isFirewallSupported(network.Service) {
+			klog.V(4).Infof("Creating firewall rules for load balancer rule: %v (%v:%v:%v)", reconciledRule.Name, protocol, reconciledRule.Publicip, port.Port)
+			if _, err := lb.updateFirewallRule(reconciledRule.Publicipid, int(port.Port), protocol, service.Spec.LoadBalancerSourceRanges); err != nil {
+				return nil, err
+			}
+		} else if isNetworkACLSupported(network.Service) {
+			klog.V(4).Infof("Creating ACL rules for load balancer rule: %v (%v:%v:%v)", reconciledRule.Name, protocol, reconciledRule.Publicip, port.Port)
+			if _, err := lb.updateNetworkACL(int(port.Port), protocol, network.Id); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -507,8 +411,11 @@ func (cs *CSCloud) getLoadBalancer(service *corev1.Service) (*loadBalancer, erro
 		return nil, fmt.Errorf("error retrieving load balancer rules: %v", err)
 	}
 
+	// Group rules by IP address to detect duplicates
+	ipToRules := make(map[string][]*cloudstack.LoadBalancerRule)
 	for _, lbRule := range l.LoadBalancerRules {
 		lb.rules[lbRule.Name] = lbRule
+		ipToRules[lbRule.Publicip] = append(ipToRules[lbRule.Publicip], lbRule)
 
 		if lb.ipAddr != "" && lb.ipAddr != lbRule.Publicip {
 			klog.Warningf("Load balancer for service %v/%v has rules associated with different IP's: %v, %v", service.Namespace, service.Name, lb.ipAddr, lbRule.Publicip)
@@ -518,9 +425,264 @@ func (cs *CSCloud) getLoadBalancer(service *corev1.Service) (*loadBalancer, erro
 		lb.ipAddrID = lbRule.Publicipid
 	}
 
+	// If we detected multiple IPs, try to clean up duplicates
+	if len(ipToRules) > 1 {
+		klog.Warningf("Detected %d different IPs for service %v/%v - attempting to clean up duplicates", len(ipToRules), service.Namespace, service.Name)
+		if err := cs.cleanupDuplicateLoadBalancerIPs(service, lb, ipToRules); err != nil {
+			klog.Errorf("Failed to clean up duplicate IPs for service %v/%v: %v", service.Namespace, service.Name, err)
+		}
+	}
+
 	klog.V(4).Infof("Load balancer %v contains %d rule(s)", lb.name, len(lb.rules))
 
 	return lb, nil
+}
+
+// cleanupDuplicateLoadBalancerIPs handles the case where a load balancer has rules on multiple IPs
+// It determines the real IP being used and releases duplicates that have no members
+func (cs *CSCloud) cleanupDuplicateLoadBalancerIPs(service *corev1.Service, lb *loadBalancer, ipToRules map[string][]*cloudstack.LoadBalancerRule) error {
+	klog.Infof("Analyzing duplicate IPs for service %v/%v", service.Namespace, service.Name)
+
+	// Determine which IP is the "real" one
+	realIP, realIPID, err := cs.determineRealLoadBalancerIP(service, lb, ipToRules)
+	if err != nil {
+		return fmt.Errorf("failed to determine real IP: %v", err)
+	}
+
+	klog.Infof("Determined real IP for service %v/%v: %v", service.Namespace, service.Name, realIP)
+
+	// Check each IP and clean up duplicates
+	for ip, rules := range ipToRules {
+		if ip == realIP {
+			continue // Skip the real IP
+		}
+
+		klog.Infof("Checking duplicate IP %v for service %v/%v", ip, service.Namespace, service.Name)
+
+		// Check if this duplicate IP has any members
+		hasMembers, err := cs.checkIPHasMembers(rules)
+		if err != nil {
+			klog.Errorf("Error checking members for IP %v: %v", ip, err)
+			continue
+		}
+
+		if hasMembers {
+			klog.Warningf("Duplicate IP %v has members - not releasing (manual intervention required)", ip)
+			continue
+		}
+
+		// Verify rules match between real and duplicate IPs
+		if !cs.verifyRulesMatch(ipToRules[realIP], rules) {
+			klog.Warningf("Rules on duplicate IP %v don't match real IP %v - skipping cleanup", ip, realIP)
+			continue
+		}
+
+		// Safe to delete - no members and rules match
+		klog.Infof("Duplicate IP %v has no members and matching rules - cleaning up", ip)
+		if err := cs.cleanupDuplicateIP(service, lb, ip, rules); err != nil {
+			klog.Errorf("Failed to cleanup duplicate IP %v: %v", ip, err)
+			continue
+		}
+
+		klog.Infof("Successfully cleaned up duplicate IP %v for service %v/%v", ip, service.Namespace, service.Name)
+	}
+
+	// Update lb to point to the real IP
+	lb.ipAddr = realIP
+	lb.ipAddrID = realIPID
+
+	return nil
+}
+
+// determineRealLoadBalancerIP figures out which IP is the actual one being used
+func (cs *CSCloud) determineRealLoadBalancerIP(service *corev1.Service, lb *loadBalancer, ipToRules map[string][]*cloudstack.LoadBalancerRule) (string, string, error) {
+	// Strategy 1: Check if service spec has a LoadBalancerIP specified
+	if service.Spec.LoadBalancerIP != "" {
+		for ip, rules := range ipToRules {
+			if ip == service.Spec.LoadBalancerIP {
+				klog.V(4).Infof("Using LoadBalancerIP from service spec: %v", ip)
+				if len(rules) > 0 {
+					return ip, rules[0].Publicipid, nil
+				}
+			}
+		}
+	}
+
+	// Strategy 2: Check service status for current ingress IP
+	if len(service.Status.LoadBalancer.Ingress) > 0 {
+		statusIP := service.Status.LoadBalancer.Ingress[0].IP
+		for ip, rules := range ipToRules {
+			if ip == statusIP {
+				klog.V(4).Infof("Using IP from service status: %v", ip)
+				if len(rules) > 0 {
+					return ip, rules[0].Publicipid, nil
+				}
+			}
+		}
+	}
+
+	// Strategy 3: Find the IP with the most members
+	var maxMembers int
+	var ipWithMaxMembers string
+	var ipIDWithMaxMembers string
+
+	for ip, rules := range ipToRules {
+		totalMembers := 0
+		for _, rule := range rules {
+			p := lb.LoadBalancer.NewListLoadBalancerRuleInstancesParams(rule.Id)
+			instances, err := lb.LoadBalancer.ListLoadBalancerRuleInstances(p)
+			if err != nil {
+				klog.Warningf("Error listing instances for rule %v: %v", rule.Name, err)
+				continue
+			}
+			totalMembers += len(instances.LoadBalancerRuleInstances)
+		}
+
+		klog.V(4).Infof("IP %v has %d total members", ip, totalMembers)
+
+		if totalMembers > maxMembers {
+			maxMembers = totalMembers
+			ipWithMaxMembers = ip
+			if len(rules) > 0 {
+				ipIDWithMaxMembers = rules[0].Publicipid
+			}
+		}
+	}
+
+	if ipWithMaxMembers != "" {
+		klog.V(4).Infof("Using IP with most members: %v (%d members)", ipWithMaxMembers, maxMembers)
+		return ipWithMaxMembers, ipIDWithMaxMembers, nil
+	}
+
+	// Strategy 4: Fall back to the first IP (alphabetically sorted for consistency)
+	var ips []string
+	for ip := range ipToRules {
+		ips = append(ips, ip)
+	}
+	if len(ips) > 0 {
+		// Sort to ensure consistent behavior
+		firstIP := ips[0]
+		for _, ip := range ips {
+			if ip < firstIP {
+				firstIP = ip
+			}
+		}
+		rules := ipToRules[firstIP]
+		if len(rules) > 0 {
+			klog.V(4).Infof("Using first IP (fallback): %v", firstIP)
+			return firstIP, rules[0].Publicipid, nil
+		}
+	}
+
+	return "", "", fmt.Errorf("could not determine real IP from %d available IPs", len(ipToRules))
+}
+
+// checkIPHasMembers checks if any rules on this IP have members
+func (cs *CSCloud) checkIPHasMembers(rules []*cloudstack.LoadBalancerRule) (bool, error) {
+	for _, rule := range rules {
+		p := cs.client.LoadBalancer.NewListLoadBalancerRuleInstancesParams(rule.Id)
+		instances, err := cs.client.LoadBalancer.ListLoadBalancerRuleInstances(p)
+		if err != nil {
+			return false, fmt.Errorf("error listing instances for rule %v: %v", rule.Name, err)
+		}
+
+		if len(instances.LoadBalancerRuleInstances) > 0 {
+			klog.V(4).Infof("Rule %v on IP %v has %d members", rule.Name, rule.Publicip, len(instances.LoadBalancerRuleInstances))
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// verifyRulesMatch checks if two sets of rules are equivalent (same ports/protocols)
+func (cs *CSCloud) verifyRulesMatch(realRules, duplicateRules []*cloudstack.LoadBalancerRule) bool {
+	if len(realRules) != len(duplicateRules) {
+		klog.V(4).Infof("Rule count mismatch: %d vs %d", len(realRules), len(duplicateRules))
+		return false
+	}
+
+	// Create a map of port:protocol for real rules
+	realRuleSet := make(map[string]bool)
+	for _, rule := range realRules {
+		key := fmt.Sprintf("%s:%s:%s", rule.Publicport, rule.Privateport, rule.Protocol)
+		realRuleSet[key] = true
+	}
+
+	// Check if all duplicate rules exist in real rules
+	for _, rule := range duplicateRules {
+		key := fmt.Sprintf("%s:%s:%s", rule.Publicport, rule.Privateport, rule.Protocol)
+		if !realRuleSet[key] {
+			klog.V(4).Infof("Rule mismatch: %v not found in real rules", key)
+			return false
+		}
+	}
+
+	return true
+}
+
+// cleanupDuplicateIP removes all rules and releases the duplicate IP
+func (cs *CSCloud) cleanupDuplicateIP(service *corev1.Service, lb *loadBalancer, ip string, rules []*cloudstack.LoadBalancerRule) error {
+	klog.Infof("Cleaning up duplicate IP %v with %d rules for service %v/%v", ip, len(rules), service.Namespace, service.Name)
+
+	// Delete all rules on this IP
+	for _, rule := range rules {
+		klog.V(4).Infof("Deleting duplicate rule %v on IP %v", rule.Name, ip)
+
+		// Get the protocol for firewall/ACL cleanup
+		protocol := ProtocolFromLoadBalancer(rule.Protocol)
+		if protocol == LoadBalancerProtocolInvalid {
+			klog.Warningf("Invalid protocol %v for rule %v - skipping firewall cleanup", rule.Protocol, rule.Name)
+		} else {
+			port, err := strconv.ParseInt(rule.Publicport, 10, 32)
+			if err != nil {
+				klog.Warningf("Error parsing port %v for rule %v: %v", rule.Publicport, rule.Name, err)
+			} else {
+				// Try to clean up firewall rules
+				networkID, err := cs.getNetworkIDFromIPAddress(rule.Publicipid)
+				if err != nil {
+					klog.Warningf("Failed to get network ID for IP %v: %v", ip, err)
+				} else {
+					network, count, err := cs.client.Network.GetNetworkByID(networkID, cloudstack.WithProject(lb.projectID))
+					if err == nil && count > 0 {
+						if isFirewallSupported(network.Service) {
+							klog.V(4).Infof("Deleting firewall rules for duplicate rule %v", rule.Name)
+							_, _ = lb.deleteFirewallRule(rule.Publicipid, int(port), protocol)
+						}
+						if isNetworkACLSupported(network.Service) {
+							klog.V(4).Infof("Deleting ACL rules for duplicate rule %v", rule.Name)
+							_, _ = lb.deleteNetworkACLRule(int(port), protocol, networkID)
+						}
+					}
+				}
+			}
+		}
+
+		// Delete the load balancer rule
+		p := cs.client.LoadBalancer.NewDeleteLoadBalancerRuleParams(rule.Id)
+		if _, err := cs.client.LoadBalancer.DeleteLoadBalancerRule(p); err != nil {
+			return fmt.Errorf("error deleting rule %v: %v", rule.Name, err)
+		}
+
+		// Remove from the lb.rules map
+		delete(lb.rules, rule.Name)
+		klog.V(4).Infof("Deleted duplicate rule %v", rule.Name)
+	}
+
+	// Release the duplicate IP
+	if len(rules) > 0 {
+		duplicateIPID := rules[0].Publicipid
+		klog.Infof("Releasing duplicate IP %v (ID: %v)", ip, duplicateIPID)
+
+		p := cs.client.Address.NewDisassociateIpAddressParams(duplicateIPID)
+		if _, err := cs.client.Address.DisassociateIpAddress(p); err != nil {
+			return fmt.Errorf("error releasing duplicate IP %v: %v", ip, err)
+		}
+
+		klog.Infof("Successfully released duplicate IP %v", ip)
+	}
+
+	return nil
 }
 
 // Get network ID from Public IP Address
@@ -1061,6 +1223,148 @@ func (lb *loadBalancer) updateFirewallRule(publicIpId string, publicPort int, pr
 
 	// return true (because we changed something), but also the last error if deleting one old rule failed
 	return true, err
+}
+
+func (lb *loadBalancer) reconcilePort(service *corev1.Service, port corev1.ServicePort, protocol LoadBalancerProtocol) (*cloudstack.LoadBalancerRule, bool, error) {
+	lbRuleName := fmt.Sprintf("%s-%s-%d", lb.name, protocol, port.Port)
+
+	existingRule, needsUpdate, err := lb.checkLoadBalancerRule(lbRuleName, port, protocol)
+	if err != nil {
+		return nil, false, err
+	}
+
+	reconciler := ruleReconciler{
+		lb:          lb,
+		service:     service,
+		port:        port,
+		protocol:    protocol,
+		lbRuleName:  lbRuleName,
+		existing:    existingRule,
+		needsUpdate: needsUpdate,
+		desiredIDs:  lb.hostIDs,
+	}
+
+	return reconciler.reconcile()
+}
+
+type ruleReconciler struct {
+	lb          *loadBalancer
+	service     *corev1.Service
+	port        corev1.ServicePort
+	protocol    LoadBalancerProtocol
+	lbRuleName  string
+	existing    *cloudstack.LoadBalancerRule
+	needsUpdate bool
+	desiredIDs  []string
+}
+
+func (r *ruleReconciler) reconcile() (*cloudstack.LoadBalancerRule, bool, error) {
+	if len(r.desiredIDs) == 0 {
+		if r.existing != nil {
+			klog.V(2).Infof("Service %s/%s rule %s: desired host list empty, keeping current members",
+				r.service.Namespace, r.service.Name, r.lbRuleName)
+		}
+		return r.existing, true, nil
+	}
+
+	validatedRule, skip, err := r.ensureRuleOnExpectedNetwork()
+	if err != nil {
+		return nil, false, err
+	}
+	if skip {
+		return validatedRule, true, nil
+	}
+
+	if err := r.ensureRuleAttributes(validatedRule); err != nil {
+		return nil, false, err
+	}
+
+	if err := r.ensureRuleMembership(validatedRule); err != nil {
+		return nil, false, err
+	}
+
+	return validatedRule, false, nil
+}
+
+func (r *ruleReconciler) ensureRuleOnExpectedNetwork() (*cloudstack.LoadBalancerRule, bool, error) {
+	if r.existing == nil {
+		return r.createRule()
+	}
+
+	valid, validationErr := r.lb.validateLoadBalancerRuleNetwork(r.existing)
+	if valid {
+		return r.existing, false, nil
+	}
+
+	klog.Warningf("Load balancer rule %s has invalid network configuration: %v", r.lbRuleName, validationErr)
+	klog.Infof("Recreating load balancer rule %s due to network mismatch", r.lbRuleName)
+
+	if err := r.lb.deleteLoadBalancerRule(r.existing); err != nil {
+		return nil, false, fmt.Errorf("failed to delete load balancer rule %s during network validation: %v", r.lbRuleName, err)
+	}
+
+	return r.createRule()
+}
+
+func (r *ruleReconciler) createRule() (*cloudstack.LoadBalancerRule, bool, error) {
+	klog.V(2).Infof("Creating load balancer rule: %v", r.lbRuleName)
+
+	rule, err := r.lb.createLoadBalancerRule(r.lbRuleName, r.port, r.protocol)
+	if err != nil {
+		return nil, false, err
+	}
+
+	klog.Infof("Creating members for new load balancer rule %s: adding %d hosts %v", r.lbRuleName, len(r.desiredIDs), r.desiredIDs)
+	if err := r.lb.assignHostsToRule(rule, r.desiredIDs); err != nil {
+		return nil, false, err
+	}
+
+	return rule, false, nil
+}
+
+func (r *ruleReconciler) ensureRuleAttributes(rule *cloudstack.LoadBalancerRule) error {
+	if !r.needsUpdate {
+		return nil
+	}
+
+	klog.V(2).Infof("Updating load balancer rule: %v", r.lbRuleName)
+	if err := r.lb.updateLoadBalancerRule(r.lbRuleName, r.protocol); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *ruleReconciler) ensureRuleMembership(rule *cloudstack.LoadBalancerRule) error {
+	p := r.lb.LoadBalancer.NewListLoadBalancerRuleInstancesParams(rule.Id)
+	instances, err := r.lb.LoadBalancer.ListLoadBalancerRuleInstances(p)
+	if err != nil {
+		return fmt.Errorf("error retrieving associated instances for rule %s: %v", r.lbRuleName, err)
+	}
+
+	assign, remove := symmetricDifference(r.desiredIDs, instances.LoadBalancerRuleInstances)
+
+	if len(assign) == 0 && len(remove) == 0 {
+		klog.V(2).Infof("Service %s/%s rule %s: members are up-to-date",
+			r.service.Namespace, r.service.Name, r.lbRuleName)
+		return nil
+	}
+
+	if len(assign) > 0 {
+		klog.Infof("Updating members of load balancer rule %s: adding %d hosts %v", r.lbRuleName, len(assign), assign)
+		if err := r.lb.assignHostsToRule(rule, assign); err != nil {
+			return err
+		}
+	}
+
+	if len(remove) > 0 {
+		klog.Infof("Updating members of load balancer rule %s: removing %d hosts %v", r.lbRuleName, len(remove), remove)
+		if err := r.lb.removeHostsFromRule(rule, remove); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (lb *loadBalancer) updateNetworkACL(publicPort int, protocol LoadBalancerProtocol, networkId string) (bool, error) {
