@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/apache/cloudstack-go/v2/cloudstack"
@@ -60,6 +61,10 @@ type CSCloud struct {
 	kubeClient kubernetes.Interface
 	projectID  string // If non-"", all resources will be created within this project
 	zone       string
+
+	// serviceMutexes protects against concurrent IP allocation for the same service
+	serviceMutexes   map[string]*sync.Mutex
+	serviceMutexesMu sync.Mutex
 }
 
 func init() {
@@ -90,8 +95,9 @@ func readConfig(config io.Reader) (*CSConfig, error) {
 // newCSCloud creates a new instance of CSCloud.
 func newCSCloud(cfg *CSConfig) (*CSCloud, error) {
 	cs := &CSCloud{
-		projectID: cfg.Global.ProjectID,
-		zone:      cfg.Global.Zone,
+		projectID:      cfg.Global.ProjectID,
+		zone:           cfg.Global.Zone,
+		serviceMutexes: make(map[string]*sync.Mutex),
 	}
 
 	if cfg.Global.APIURL != "" && cfg.Global.APIKey != "" && cfg.Global.SecretKey != "" {
@@ -268,6 +274,7 @@ func (cs *CSCloud) startEndpointWatcher(stop <-chan struct{}) {
 
 	// Create a map to debounce updates (avoid too frequent updates for the same service)
 	pendingUpdates := make(map[string]*time.Timer)
+	var pendingMu sync.Mutex
 
 	// Watch all endpoints
 	watchlist := &metav1.ListOptions{
@@ -307,7 +314,7 @@ func (cs *CSCloud) startEndpointWatcher(stop <-chan struct{}) {
 				if event.Type == watch.Modified || event.Type == watch.Added {
 					if endpoints, ok := event.Object.(*corev1.Endpoints); ok {
 						klog.V(4).Infof("Received endpoint event: %s for %s/%s", event.Type, endpoints.Namespace, endpoints.Name)
-						cs.handleEndpointUpdate(endpoints, pendingUpdates)
+						cs.handleEndpointUpdate(endpoints, pendingUpdates, &pendingMu)
 					}
 				}
 			}
@@ -319,7 +326,7 @@ func (cs *CSCloud) startEndpointWatcher(stop <-chan struct{}) {
 }
 
 // handleEndpointUpdate processes endpoint changes and triggers load balancer updates if needed
-func (cs *CSCloud) handleEndpointUpdate(endpoints *corev1.Endpoints, pendingUpdates map[string]*time.Timer) {
+func (cs *CSCloud) handleEndpointUpdate(endpoints *corev1.Endpoints, pendingUpdates map[string]*time.Timer, mu *sync.Mutex) {
 	serviceKey := endpoints.Namespace + "/" + endpoints.Name
 
 	klog.V(4).Infof("Processing endpoint update for service %s", serviceKey)
@@ -348,18 +355,24 @@ func (cs *CSCloud) handleEndpointUpdate(endpoints *corev1.Endpoints, pendingUpda
 	klog.V(2).Infof("Endpoint change detected for LoadBalancer service %s with Local traffic policy - scheduling update", serviceKey)
 
 	// Cancel any existing pending update for this service
+	mu.Lock()
 	if timer, exists := pendingUpdates[serviceKey]; exists {
 		klog.V(4).Infof("Cancelling previous pending update for service %s", serviceKey)
 		timer.Stop()
 		delete(pendingUpdates, serviceKey)
 	}
+	mu.Unlock()
 
 	// Schedule a debounced update (wait 10 seconds for more changes)
 	klog.V(4).Infof("Scheduling debounced update for service %s (10s delay)", serviceKey)
+	mu.Lock()
 	pendingUpdates[serviceKey] = time.AfterFunc(10*time.Second, func() {
+		mu.Lock()
 		delete(pendingUpdates, serviceKey)
+		mu.Unlock()
 		cs.updateLoadBalancerForEndpointChange(service)
 	})
+	mu.Unlock()
 }
 
 // updateLoadBalancerForEndpointChange triggers EnsureLoadBalancer for a service whose endpoints changed

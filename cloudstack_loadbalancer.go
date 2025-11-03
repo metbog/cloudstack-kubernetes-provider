@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/apache/cloudstack-go/v2/cloudstack"
 	"k8s.io/klog/v2"
@@ -122,18 +123,71 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 	// Verify that all the hosts belong to the same network, and retrieve their ID's.
 	lb.hostIDs, lb.networkID, err = cs.verifyHosts(filteredNodes)
 	if err != nil {
+		return nil, fmt.Errorf("failed to verify hosts for service %s/%s: %v", service.Namespace, service.Name, err)
+	}
+
+	if lb.networkID == "" {
+		return nil, fmt.Errorf("networkID is empty after verifyHosts for service %s/%s - cannot proceed with load balancer creation", service.Namespace, service.Name)
+	}
+
+	klog.V(2).Infof("Service %s/%s: expected host IDs: %v, networkID: %s", service.Namespace, service.Name, lb.hostIDs, lb.networkID)
+
+	// Get or create a mutex for this service to prevent concurrent IP allocation
+	serviceKey := service.Namespace + "/" + service.Name
+	cs.serviceMutexesMu.Lock()
+	serviceMu, exists := cs.serviceMutexes[serviceKey]
+	if !exists {
+		serviceMu = &sync.Mutex{}
+		cs.serviceMutexes[serviceKey] = serviceMu
+	}
+	cs.serviceMutexesMu.Unlock()
+
+	// Lock this service to prevent concurrent IP allocation
+	serviceMu.Lock()
+	defer serviceMu.Unlock()
+
+	// Re-check after acquiring lock - another goroutine might have allocated IP
+	// Preserve networkID, hostIDs, and algorithm as they were already determined
+	savedNetworkID := lb.networkID
+	savedHostIDs := lb.hostIDs
+	savedAlgorithm := lb.algorithm
+
+	klog.V(4).Infof("Service %s/%s: Before re-check - saved networkID: %s, hostIDs: %v", service.Namespace, service.Name, savedNetworkID, savedHostIDs)
+
+	lb, err = cs.getLoadBalancer(service)
+	if err != nil {
 		return nil, err
 	}
 
-	klog.V(2).Infof("Service %s/%s: expected host IDs: %v", service.Namespace, service.Name, lb.hostIDs)
+	// Restore the networkID, hostIDs, and algorithm that were determined before locking
+	// These are needed for IP allocation and rule creation
+	lb.networkID = savedNetworkID
+	lb.hostIDs = savedHostIDs
+	lb.algorithm = savedAlgorithm
+
+	klog.V(4).Infof("Service %s/%s: After restore - networkID: %s, hostIDs: %v", service.Namespace, service.Name, lb.networkID, lb.hostIDs)
+
+	// Validate that networkID is set before attempting IP allocation
+	if lb.networkID == "" {
+		klog.Errorf("Service %s/%s: networkID is empty after restore! savedNetworkID was: %q", service.Namespace, service.Name, savedNetworkID)
+		return nil, fmt.Errorf("networkID is empty - cannot allocate IP for service %s/%s. This may occur when no nodes are available and getDefaultNetworkID() failed or returned empty", service.Namespace, service.Name)
+	}
 
 	if !lb.hasLoadBalancerIP() {
-		// Create or retrieve the load balancer IP.
-		if err := lb.getLoadBalancerIP(service.Spec.LoadBalancerIP); err != nil {
-			return nil, err
+		// Prefer reusing an existing IP from service spec or status before allocating a new one
+		preferredIP := service.Spec.LoadBalancerIP
+		if preferredIP == "" && len(service.Status.LoadBalancer.Ingress) > 0 {
+			if service.Status.LoadBalancer.Ingress[0].IP != "" {
+				preferredIP = service.Status.LoadBalancer.Ingress[0].IP
+			}
 		}
 
-		if lb.ipAddr != "" && lb.ipAddr != service.Spec.LoadBalancerIP {
+		// Create or retrieve the load balancer IP using the preferred IP when available
+		if err := lb.getLoadBalancerIP(preferredIP); err != nil {
+			return nil, fmt.Errorf("failed to get load balancer IP for service %s/%s: %v", service.Namespace, service.Name, err)
+		}
+
+		if lb.ipAddr != "" && preferredIP != "" && lb.ipAddr != preferredIP {
 			defer func(lb *loadBalancer) {
 				if err != nil {
 					if err := lb.releaseLoadBalancerIP(); err != nil {
@@ -202,7 +256,12 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 		}
 
 		klog.V(4).Infof("Deleting Network ACL rules associated with load balancer rule: %v (%v:%v)", lbRule.Name, protocol, port)
-		if _, err := lb.deleteNetworkACLRule(int(port), protocol, lb.networkID); err != nil {
+		// Derive network from the rule's own Public IP to ensure correct ACL deletion
+		networkId, netErr := cs.getNetworkIDFromIPAddress(lbRule.Publicipid)
+		if netErr != nil {
+			return nil, netErr
+		}
+		if _, err := lb.deleteNetworkACLRule(int(port), protocol, networkId); err != nil {
 			return nil, err
 		}
 
@@ -411,21 +470,37 @@ func (cs *CSCloud) getLoadBalancer(service *corev1.Service) (*loadBalancer, erro
 		return nil, fmt.Errorf("error retrieving load balancer rules: %v", err)
 	}
 
-	// Group rules by IP address to detect duplicates
+	// Group rules by IP address to detect duplicates, but only for our service's rule name prefix
 	ipToRules := make(map[string][]*cloudstack.LoadBalancerRule)
+	prefix := lb.name + "-"
 	for _, lbRule := range l.LoadBalancerRules {
-		lb.rules[lbRule.Name] = lbRule
-		ipToRules[lbRule.Publicip] = append(ipToRules[lbRule.Publicip], lbRule)
-
-		if lb.ipAddr != "" && lb.ipAddr != lbRule.Publicip {
-			klog.Warningf("Load balancer for service %v/%v has rules associated with different IP's: %v, %v", service.Namespace, service.Name, lb.ipAddr, lbRule.Publicip)
+		if !strings.HasPrefix(lbRule.Name, prefix) {
+			continue
 		}
 
-		lb.ipAddr = lbRule.Publicip
-		lb.ipAddrID = lbRule.Publicipid
+		ipToRules[lbRule.Publicip] = append(ipToRules[lbRule.Publicip], lbRule)
 	}
 
-	// If we detected multiple IPs, try to clean up duplicates
+	// If no rules found for this service, return empty lb
+	if len(ipToRules) == 0 {
+		klog.V(4).Infof("Load balancer %v contains 0 rule(s)", lb.name)
+		return lb, nil
+	}
+
+	// Determine canonical/real IP deterministically
+	realIP, realIPID, err := cs.determineRealLoadBalancerIP(service, lb, ipToRules)
+	if err != nil {
+		return nil, err
+	}
+	lb.ipAddr = realIP
+	lb.ipAddrID = realIPID
+
+	// Populate lb.rules ONLY from the canonical IP
+	for _, rule := range ipToRules[realIP] {
+		lb.rules[rule.Name] = rule
+	}
+
+	// If we detected multiple IPs, try to clean up duplicates (non-canonical IPs)
 	if len(ipToRules) > 1 {
 		klog.Warningf("Detected %d different IPs for service %v/%v - attempting to clean up duplicates", len(ipToRules), service.Namespace, service.Name)
 		if err := cs.cleanupDuplicateLoadBalancerIPs(service, lb, ipToRules); err != nil {
@@ -433,7 +508,7 @@ func (cs *CSCloud) getLoadBalancer(service *corev1.Service) (*loadBalancer, erro
 		}
 	}
 
-	klog.V(4).Infof("Load balancer %v contains %d rule(s)", lb.name, len(lb.rules))
+	klog.V(4).Infof("Load balancer %v contains %d rule(s) on IP %s", lb.name, len(lb.rules), lb.ipAddr)
 
 	return lb, nil
 }
@@ -728,9 +803,14 @@ func (cs *CSCloud) getDefaultNetworkID() (string, error) {
 					cloudstack.WithProject(cs.projectID),
 				)
 				if err == nil && count > 0 && len(vm.Nic) > 0 {
+					networkID := vm.Nic[0].Networkid
+					if networkID == "" {
+						klog.V(4).Infof("getDefaultNetworkID: Network ID is empty for node %s (VM: %s), skipping", node.Name, vm.Name)
+						continue
+					}
 					klog.V(4).Infof("getDefaultNetworkID: Using network %s from Kubernetes node %s (VM: %s)",
-						vm.Nic[0].Networkid, node.Name, vm.Name)
-					return vm.Nic[0].Networkid, nil
+						networkID, node.Name, vm.Name)
+					return networkID, nil
 				}
 			}
 		}
@@ -751,8 +831,13 @@ func (cs *CSCloud) getDefaultNetworkID() (string, error) {
 		// Use the network from the first VM found
 		for _, vm := range l.VirtualMachines {
 			if len(vm.Nic) > 0 {
-				klog.V(4).Infof("getDefaultNetworkID: Using network %s from existing VM %s", vm.Nic[0].Networkid, vm.Name)
-				return vm.Nic[0].Networkid, nil
+				networkID := vm.Nic[0].Networkid
+				if networkID == "" {
+					klog.V(4).Infof("getDefaultNetworkID: Network ID is empty for VM %s, skipping", vm.Name)
+					continue
+				}
+				klog.V(4).Infof("getDefaultNetworkID: Using network %s from existing VM %s", networkID, vm.Name)
+				return networkID, nil
 			}
 		}
 	}
@@ -774,6 +859,9 @@ func (cs *CSCloud) getDefaultNetworkID() (string, error) {
 
 	// Use the first network found
 	networkID := networks.Networks[0].Id
+	if networkID == "" {
+		return "", fmt.Errorf("network ID is empty for network %s - cannot use as default network", networks.Networks[0].Name)
+	}
 	klog.V(4).Infof("getDefaultNetworkID: Using first available network %s (%s)", networkID, networks.Networks[0].Name)
 	return networkID, nil
 }
@@ -789,6 +877,10 @@ func (cs *CSCloud) verifyHosts(nodes []*corev1.Node) ([]string, string, error) {
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to get default network ID for empty load balancer: %v", err)
 		}
+		if networkID == "" {
+			return nil, "", fmt.Errorf("getDefaultNetworkID returned empty networkID without error - this should not happen")
+		}
+		klog.V(2).Infof("verifyHosts: Using default network ID %s for empty load balancer", networkID)
 		return []string{}, networkID, nil
 	}
 
@@ -888,14 +980,20 @@ func (lb *loadBalancer) getPublicIPAddress(loadBalancerIP string) error {
 // associatePublicIPAddress associates a new IP and sets the address and it's ID.
 func (lb *loadBalancer) associatePublicIPAddress() error {
 	klog.V(4).Infof("Allocate new IP for load balancer: %v", lb.name)
+
+	// Validate networkID is set before attempting to allocate IP
+	if lb.networkID == "" {
+		return fmt.Errorf("networkID is empty - cannot allocate IP for load balancer %v. This typically occurs when no nodes are available and getDefaultNetworkID() failed or returned empty", lb.name)
+	}
+
 	// If a network belongs to a VPC, the IP address needs to be associated with
 	// the VPC instead of with the network.
 	network, count, err := lb.Network.GetNetworkByID(lb.networkID, cloudstack.WithProject(lb.projectID))
 	if err != nil {
 		if count == 0 {
-			return fmt.Errorf("could not find network %v", lb.networkID)
+			return fmt.Errorf("could not find network %v (networkID may be invalid or network was deleted)", lb.networkID)
 		}
-		return fmt.Errorf("error retrieving network: %v", err)
+		return fmt.Errorf("error retrieving network %v: %v", lb.networkID, err)
 	}
 
 	p := lb.Address.NewAssociateIpAddressParams()
@@ -1389,7 +1487,7 @@ func (lb *loadBalancer) updateNetworkACL(publicPort int, protocol LoadBalancerPr
 	}
 
 	if networkAclList.Name == "default_allow" || networkAclList.Name == "default_deny" {
-		klog.Infof("Network is using a default network ACL. Cannot add ACL rules to default ACLs")
+		klog.V(2).Infof("Network is using a default network ACL. Cannot add ACL rules to default ACLs")
 		return true, err
 	}
 
